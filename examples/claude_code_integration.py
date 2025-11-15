@@ -203,10 +203,10 @@ class ClaudeCodeWrapper:
 
                         self.last_log_position = file_size
 
-                        # Analyze accumulated output every 15 seconds (less frequent to avoid false positives)
+                        # Analyze accumulated output every 8 seconds for faster detection
                         now = datetime.now()
-                        if (now - last_analysis_time).seconds >= 15 and len(output_buffer) > 5:
-                            # Only analyze if we have substantial content (not just UI updates)
+                        if (now - last_analysis_time).seconds >= 8 and len(output_buffer) > 3:
+                            # Analyze if we have meaningful content
                             await self._analyze_output('\n'.join(output_buffer))
                             output_buffer = []
                             last_analysis_time = now
@@ -243,11 +243,12 @@ class ClaudeCodeWrapper:
 
                 if drift_result.get('drifted'):
                     print("\n" + "=" * 60)
-                    print("⚠️  CONTEXT DRIFT WARNING")
+                    print("⚠️  CONTEXT DRIFT DETECTED!")
                     print(f"   Reason: {drift_result.get('reason', 'unknown')}")
-                    print("   💡 Consider stopping (Ctrl-C) and refocusing")
+                    print("   → Intervening: Going back to previous prompt and adding drift warning...")
                     print("=" * 60 + "\n")
                     self.drift_detected = True
+                    await self._intervene_context_drift()
 
             # Check for sycophancy
             sycophancy_result = await self.marionette.sycophancy_detector.check(
@@ -256,10 +257,11 @@ class ClaudeCodeWrapper:
 
             if sycophancy_result.get('detected'):
                 print("\n" + "=" * 60)
-                print("⚠️  SYCOPHANCY DETECTED")
+                print("⚠️  SYCOPHANCY DETECTED!")
                 print(f"   Reason: {sycophancy_result.get('reason', 'unknown')}")
-                print("   💡 Claude may be over-agreeing without critical thinking")
+                print("   → Intervening: Going back to previous prompt and adding critical thinking reminder...")
                 print("=" * 60 + "\n")
+                await self._intervene_sycophancy()
 
         except Exception as e:
             print(f"⚠️  Analysis error: {e}")
@@ -387,6 +389,132 @@ class ClaudeCodeWrapper:
             "tmux", "send-keys", "-t", self.session_name,
             "Escape", "Escape"
         ], check=False)
+
+    async def _intervene_context_drift(self):
+        """Intervene when context drift is detected by going back and adding a warning."""
+        print("🔄 Intervention: Pausing Claude, going back to previous prompt, adding context drift warning...")
+
+        # Step 1: Press Esc to pause
+        subprocess.run([
+            "tmux", "send-keys", "-t", self.session_name,
+            "Escape"
+        ], check=False)
+        time.sleep(1)
+
+        # Step 2: Double Esc with delay
+        subprocess.run([
+            "tmux", "send-keys", "-t", self.session_name,
+            "Escape"
+        ], check=False)
+        time.sleep(0.2)
+        subprocess.run([
+            "tmux", "send-keys", "-t", self.session_name,
+            "Escape"
+        ], check=False)
+
+        # Step 3: Press arrow up to get previous prompt
+        subprocess.run([
+            "tmux", "send-keys", "-t", self.session_name,
+            "Up"
+        ], check=False)
+
+        # Step 4: Press Enter
+        subprocess.run([
+            "tmux", "send-keys", "-t", self.session_name,
+            "C-m"
+        ], check=False)
+        time.sleep(0.5)
+
+        # Step 5: Press Enter again
+        subprocess.run([
+            "tmux", "send-keys", "-t", self.session_name,
+            "C-m"
+        ], check=False)
+        time.sleep(0.5)
+
+        # Step 6: Write the context drift warning
+        warning_text = "Be aware of context drift at the end. Revise your main goal, state at the TOP, then revise your course of action. Ensure it aligns"
+        subprocess.run([
+            "tmux", "send-keys", "-t", self.session_name,
+            "-l",
+            warning_text
+        ], check=False)
+
+        # Step 7: Press Enter to send
+        subprocess.run([
+            "tmux", "send-keys", "-t", self.session_name,
+            "C-m"
+        ], check=False)
+        time.sleep(0.2)
+        subprocess.run([
+            "tmux", "send-keys", "-t", self.session_name,
+            "C-m"
+        ], check=False)
+
+        print("✅ Context drift intervention complete")
+
+    async def _intervene_sycophancy(self):
+        """Intervene when sycophancy is detected by going back and adding a critical thinking reminder."""
+        print("🔄 Intervention: Pausing Claude, going back to previous prompt, adding critical thinking reminder...")
+
+        # Step 1: Press Esc to pause
+        subprocess.run([
+            "tmux", "send-keys", "-t", self.session_name,
+            "Escape"
+        ], check=False)
+        time.sleep(1)
+
+        # Step 2: Double Esc with delay
+        subprocess.run([
+            "tmux", "send-keys", "-t", self.session_name,
+            "Escape"
+        ], check=False)
+        time.sleep(0.2)
+        subprocess.run([
+            "tmux", "send-keys", "-t", self.session_name,
+            "Escape"
+        ], check=False)
+
+        # Step 3: Press arrow up to get previous prompt
+        subprocess.run([
+            "tmux", "send-keys", "-t", self.session_name,
+            "Up"
+        ], check=False)
+
+        # Step 4: Press Enter
+        subprocess.run([
+            "tmux", "send-keys", "-t", self.session_name,
+            "C-m"
+        ], check=False)
+        time.sleep(0.5)
+
+        # Step 5: Press Enter again
+        subprocess.run([
+            "tmux", "send-keys", "-t", self.session_name,
+            "C-m"
+        ], check=False)
+        time.sleep(0.5)
+
+        # Step 6: Write the sycophancy warning
+        warning_text = "Be critical. Don't be sycophantic. Feel free to agree or disagree."
+        subprocess.run([
+            "tmux", "send-keys", "-t", self.session_name,
+            "-l",
+            warning_text
+        ], check=False)
+
+        # Step 7: Press Enter to send
+        subprocess.run([
+            "tmux", "send-keys", "-t", self.session_name,
+            "C-m"
+        ], check=False)
+        time.sleep(0.2)
+        subprocess.run([
+            "tmux", "send-keys", "-t", self.session_name,
+            "C-m"
+        ], check=False)
+
+        print("✅ Sycophancy intervention complete")
 
     async def cleanup(self):
         """Clean up tmux session and log file."""
