@@ -225,16 +225,57 @@ class PromptQualityAnalyzer:
     
     async def analyze(self, user_prompt: str) -> Dict:
         """Analyze prompt quality and suggest improvements if needed."""
-        prompt = f"""Rate this coding prompt for quality:
+        prompt = f"""You are evaluating whether a user prompt is good enough for a coding AI assistant.
 
-"{user_prompt}"
+USER PROMPT: "{user_prompt}"
 
-Evaluate:
-1. Specificity (0-10): Are requirements clear and specific?
-2. Completeness (0-10): Is all necessary context provided?
-3. Ambiguity (0-10): How much is left to interpretation? (lower is better)
+IMPORTANT RULES:
+1. **Casual conversation is ALWAYS approved** - greetings, questions, clarifications
+2. **Only reject vague BUILD/IMPLEMENT requests** - when user wants code but gives almost no detail
+3. **Reasonable prompts should pass** - don't be pedantic about minor missing details
 
-A good prompt scores 6+ on specificity and completeness, and below 5 on ambiguity.
+EXAMPLES:
+
+✅ APPROVE THESE (casual conversation):
+- "hi", "hello", "hey"
+- "who are you?", "what can you do?"
+- "thanks", "ok", "got it"
+
+❌ REJECT THESE (too vague for building):
+- "make a website" (no details at all)
+- "fix my code" (what code? what's wrong?)
+- "build an app" (what kind? what features?)
+
+❌ REJECT THESE (has some detail but still not enough):
+- "wanna build a html+css dog website, two pages, first page contains title called 'Dog Paws Cleaner', and a big image of a dog underneath that which i'll upload myself. That's it. Second page, is a contact form, username, email, that's it."
+  → Has tech stack and pages, but missing: layout details, styling/colors, what happens with form, image sizing. Needs more detail!
+
+- "create a todo app with react"
+  → What features? What should todos have? How do they persist? Needs specifics.
+
+✅ APPROVE THESE (reasonable build requests with sufficient detail):
+- "build a html+css dog website, two pages, first page has title 'Dog Paws Cleaner' and a big dog image that takes full width. Second page is contact form with username and email fields. White and brown colors, black text, frontend only, no backend."
+  → Has tech stack, pages described, layout hints (full width), color scheme, clarified frontend only. Good enough!
+
+- "create a python script that reads a CSV file and prints the first 5 rows"
+  → Clear language, clear task, clear output. Good enough!
+
+❌ REJECT THESE (extremely vague build requests):
+- "make a website for my business"
+  → What kind of business? What content? What pages? Way too vague.
+
+- "i need a form"
+  → What fields? What should it do? What tech? Too vague.
+
+Evaluate the prompt:
+- If it's casual conversation → ALWAYS approve
+- If it's a build request → check if it has basic details (tech, what to build, rough idea of how)
+- Don't nitpick about fonts, exact layouts, or minor styling details
+
+Rate 0-10:
+1. Specificity: Is the core request clear?
+2. Completeness: Are basic requirements provided?
+3. Ambiguity: How unclear is it? (lower = clearer)
 
 Respond with JSON:
 {{
@@ -243,17 +284,19 @@ Respond with JSON:
     "ambiguity": 0-10,
     "approved": true/false,
     "feedback": "constructive feedback if not approved",
-    "suggestions": ["specific improvement 1", "improvement 2"]
+    "suggestions": ["improvement 1", "improvement 2"]
 }}"""
         
         result = await self.pro.generate_json(prompt)
-        
-        # Set approval based on thresholds
-        approved = (
-            result.get("specificity", 0) >= 6 and
-            result.get("completeness", 0) >= 6 and
-            result.get("ambiguity", 10) <= 5
-        )
-        
-        result["approved"] = approved
+
+        # Trust the AI's judgment - only override if it didn't provide approval field
+        if "approved" not in result:
+            # Fallback: Set approval based on thresholds
+            approved = (
+                result.get("specificity", 0) >= 4 and
+                result.get("completeness", 0) >= 4 and
+                result.get("ambiguity", 10) <= 7
+            )
+            result["approved"] = approved
+
         return result
