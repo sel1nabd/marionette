@@ -37,7 +37,12 @@ class GeminiClient:
         # Build tools list
         tools = []
         if grounding:
-            tools.append(genai.Tool.from_google_search_retrieval())
+            try:
+                from google.generativeai import grounding
+                tools.append(grounding.GoogleSearchRetrieval())
+            except (ImportError, AttributeError):
+                # Grounding not available in this API version
+                tools = []
         
         try:
             if system_instruction:
