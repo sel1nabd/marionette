@@ -26,7 +26,6 @@ wheels/
 # Environment
 .env
 .env.local
-.env.example
 
 # Logs
 *.log
