@@ -1,129 +1,419 @@
 #!/usr/bin/env python3
 """
-Example: Integrating Marionette with Claude Code
-This shows how to wrap an existing CLI coding agent with Marionette supervision.
+Marionette wrapper for Claude Code CLI using tmux + tee architecture.
+
+Architecture:
+1. Launch Claude Code in tmux session
+2. Stream output to log file via tee
+3. Monitor log file for issues (drift, sycophancy, debug loops)
+4. Send keystrokes via tmux send-keys (Ctrl-C, Esc, prompts)
+5. Validate user prompts before injection
 """
 
 import asyncio
 import subprocess
-import sys
+import tempfile
 from pathlib import Path
+import os
+import sys
+import time
+from datetime import datetime
+
+# Add parent directory to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from orchestrator.marionette import Marionette
 from orchestrator.config import Config
 
 
 class ClaudeCodeWrapper:
-    """Wraps Claude Code with Marionette supervision."""
-    
+    """
+    Wraps Claude Code CLI in tmux with full supervision.
+
+    Features:
+    - Deterministic keystroke injection via tmux send-keys
+    - Real-time output monitoring via tee log file
+    - Prompt validation before sending to Claude
+    - Detection and intervention (Ctrl-C to stop, Esc to break loops)
+    """
+
     def __init__(self, marionette: Marionette):
         self.marionette = marionette
-        self.claude_process = None
-    
+        self.session_name = f"marionette_claude_{os.getpid()}"
+        self.log_file = Path(tempfile.mktemp(suffix=".log", prefix="claude_output_"))
+        self.running = False
+        self.last_log_position = 0
+
+        # Intervention state
+        self.loop_detected = False
+        self.drift_detected = False
+
     async def start(self):
-        """Start Claude Code process with supervision."""
-        print("🎭 Starting Claude Code with Marionette supervision...")
-        
-        # Start Marionette
-        await self.marionette.start()
-        
-        # Start Claude Code as subprocess
-        # Note: This is a conceptual example - actual implementation depends on
-        # how your CLI agent accepts input/output
-        
+        """Launch Claude Code in tmux and start monitoring."""
+        print("🎭 Marionette - Claude Code Supervisor")
+        print("=" * 60)
+        print(f"📋 Session: {self.session_name}")
+        print(f"📝 Log file: {self.log_file}")
+        print(f"🔧 Working directory: {os.getcwd()}")
+        print("=" * 60)
+        print()
+
+        # Create tmux session with Claude Code
+        self._launch_claude_in_tmux()
+
+        self.running = True
+
+        # Start monitoring tasks
+        monitor_task = asyncio.create_task(self._monitor_output())
+        interaction_task = asyncio.create_task(self._user_interaction_loop())
+
         try:
-            self.claude_process = await asyncio.create_subprocess_exec(
-                "claude-code",  # or "aider", etc.
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
+            await asyncio.gather(monitor_task, interaction_task)
+        except KeyboardInterrupt:
+            print("\n\n🛑 Shutting down Marionette...")
+            await self.cleanup()
+
+    def _launch_claude_in_tmux(self):
+        """Launch Claude Code CLI inside a tmux session with tee logging."""
+
+        # Kill existing session if it exists
+        subprocess.run(
+            ["tmux", "kill-session", "-t", self.session_name],
+            capture_output=True
+        )
+
+        # Create new tmux session with persistent bash first
+        # This ensures the session stays alive and stdin remains open
+        try:
+            # Step 1: Create tmux session with bash
+            result = subprocess.run([
+                "tmux", "new-session", "-d", "-s", self.session_name,
+                "-x", "120", "-y", "40",
+                "bash"
+            ], capture_output=True, text=True)
+
+            if result.returncode != 0:
+                print(f"❌ Failed to create tmux session: {result.stderr}")
+                return
+
+            # Step 2: Set up logging pipe and launch Claude
+            # We need to keep Claude interactive, so we use process substitution
+            # to tee output while maintaining the interactive session
+            # Using --dangerously-skip-permissions to avoid permission prompts
+            subprocess.run([
+                "tmux", "send-keys", "-t", self.session_name,
+                f"script -q {self.log_file} claude --dangerously-skip-permissions", "C-m"
+            ], check=False)
+
+            # Give Claude time to start
+            time.sleep(1)
+
+            # Verify session exists
+            check = subprocess.run(
+                ["tmux", "list-sessions"],
+                capture_output=True,
+                text=True
             )
-            
-            # Start monitoring tasks
-            asyncio.create_task(self._monitor_stdout())
-            asyncio.create_task(self._monitor_stderr())
-            
-        except FileNotFoundError:
-            print("❌ claude-code not found. Install it first:")
-            print("   pip install claude-code")
-            sys.exit(1)
-    
-    async def send_prompt(self, user_input: str):
-        """Send user input through Marionette then to Claude Code."""
-        # Check prompt quality
-        check = await self.marionette.process_user_input(user_input)
-        
-        if not check["approved"]:
-            print("\n⚠️ PROMPT REJECTED BY MARIONETTE")
-            print(f"Feedback: {check['feedback']}")
-            for suggestion in check.get('suggestions', []):
-                print(f"  • {suggestion}")
-            return False
-        
-        # Send to Claude Code
-        self.claude_process.stdin.write(f"{user_input}\n".encode())
-        await self.claude_process.stdin.drain()
-        return True
-    
-    async def _monitor_stdout(self):
-        """Monitor Claude Code output and send through Marionette."""
-        async for line in self.claude_process.stdout:
-            output = line.decode().strip()
-            print(f"🤖 Claude: {output}")
-            
-            # Process through Marionette
-            interventions = await self.marionette.process_agent_output(output)
-            
-            if interventions.get("kill_agent"):
-                print("\n🛑 MARIONETTE KILLED AGENT - Debug loop detected")
-                self.claude_process.kill()
-                
-                for suggestion in interventions.get("suggestions", []):
-                    print(suggestion)
-    
-    async def _monitor_stderr(self):
-        """Monitor errors from Claude Code."""
-        async for line in self.claude_process.stderr:
-            error = line.decode().strip()
-            print(f"❌ Error: {error}")
-            
-            # Process as error
-            await self.marionette.process_agent_output(error, is_error=True)
-    
-    async def interactive_loop(self):
-        """Run interactive session with supervision."""
-        while True:
+
+            if self.session_name in check.stdout:
+                print(f"✅ Claude Code launched in tmux session: {self.session_name}")
+                print(f"   View session: tmux attach -t {self.session_name}")
+                print()
+            else:
+                print(f"⚠️  Session created but not found in list.")
+                print()
+
+        except Exception as e:
+            print(f"❌ Error launching tmux: {e}")
+
+    async def _monitor_output(self):
+        """Monitor Claude Code output log file for issues."""
+        import re
+        output_buffer = []
+        last_analysis_time = datetime.now()
+        ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+        seen_lines = set()  # Deduplicate repeated lines
+
+        while self.running:
             try:
-                user_input = input("\n👤 You: ").strip()
-                
-                if user_input == "/exit":
-                    break
-                
-                if user_input == "/status":
-                    status = self.marionette.get_status()
-                    print(f"\n📊 Session: {status['session_id']}")
-                    print(f"Interactions: {status['user_inputs']}")
+                if self.log_file.exists():
+                    file_size = self.log_file.stat().st_size
+
+                    if file_size > self.last_log_position:
+                        with open(self.log_file, 'r', encoding='utf-8', errors='ignore') as f:
+                            f.seek(self.last_log_position)
+                            new_content = f.read()
+
+                            if new_content.strip():
+                                # Strip ANSI escape codes
+                                clean_content = ansi_escape.sub('', new_content)
+                                lines = clean_content.strip().split('\n')
+
+                                for line in lines:
+                                    stripped = line.strip()
+
+                                    # Skip if we've seen this exact line recently
+                                    if stripped in seen_lines:
+                                        continue
+
+                                    # Aggressive filtering for UI noise
+                                    skip_patterns = [
+                                        '────────', '? for shortcuts', 'Thinking off', 'ctrl-g to edit',
+                                        '/ide for VS Code', '╭───', '╰───', '│', 'Mulling', 'Creating',
+                                        'Blanching', 'Harmonizing', '(esc to interrupt', 'running stop hook',
+                                        '> Try', '> hi', '> ', '[G', '⎿  Tip:', '⎿  Next:',
+                                        'Use /statusline', 'Create HTML structure',
+                                        'Create file', 'Write(', 'Read(', 'Edit(',
+                                        '⏵⏵', 'shift+'  # Permission toggles and shortcuts
+                                    ]
+
+                                    # Loading spinners (NOT including ⏺ which is Claude's response marker)
+                                    spinner_chars = ['✢', '✳', '✶', '✻', '✽', '·']
+
+                                    if any(skip in stripped for skip in skip_patterns):
+                                        continue
+
+                                    if any(char in stripped and len(stripped) < 50 for char in spinner_chars):
+                                        continue
+
+                                    # Special handling for ⏺ (Claude's response marker)
+                                    if stripped.startswith('⏺'):
+                                        response_text = stripped[1:].strip()
+                                        if response_text and len(response_text) > 10:
+                                            print(f"🤖 {response_text}")
+                                            output_buffer.append(response_text)
+                                            seen_lines.add(response_text)
+                                        continue
+
+                                    # Skip short lines that start with > (prompt echo)
+                                    if stripped.startswith('>') and len(stripped) < 100:
+                                        continue
+
+                                    # Only show substantial, meaningful lines
+                                    if len(stripped) > 20 and not stripped.startswith('>'):
+                                        # Avoid duplicate prints
+                                        if stripped not in seen_lines:
+                                            print(f"🤖 {stripped}")
+                                            output_buffer.append(stripped)
+                                            seen_lines.add(stripped)
+
+                                            # Keep seen_lines from growing forever
+                                            if len(seen_lines) > 100:
+                                                seen_lines.clear()
+
+                        self.last_log_position = file_size
+
+                        # Analyze accumulated output every 15 seconds (less frequent to avoid false positives)
+                        now = datetime.now()
+                        if (now - last_analysis_time).seconds >= 15 and len(output_buffer) > 5:
+                            # Only analyze if we have substantial content (not just UI updates)
+                            await self._analyze_output('\n'.join(output_buffer))
+                            output_buffer = []
+                            last_analysis_time = now
+
+                await asyncio.sleep(0.5)
+
+            except Exception as e:
+                print(f"⚠️  Monitor error: {e}")
+                await asyncio.sleep(1)
+
+    async def _analyze_output(self, output: str):
+        """Analyze Claude's output for issues and intervene if needed."""
+        try:
+            # Check for debug loops
+            loop_result = await self.marionette.debug_loop_monitor.check(
+                [{"error": output}]  # Pass as error history format
+            )
+
+            if loop_result.get('detected'):
+                print("\n" + "=" * 60)
+                print("🔴 DEBUG LOOP DETECTED!")
+                print(f"   Reason: {loop_result.get('reason', 'unknown')}")
+                print("   → Sending Esc Esc to break loop...")
+                print("=" * 60 + "\n")
+
+                self.loop_detected = True
+                self._send_escape_sequence()
+
+            # Check for context drift (if we have learned the initial goal)
+            if self.marionette.context_drift_monitor.initial_goal:
+                drift_result = await self.marionette.context_drift_monitor.check(
+                    recent_actions=[output]
+                )
+
+                if drift_result.get('drifted'):
+                    print("\n" + "=" * 60)
+                    print("⚠️  CONTEXT DRIFT WARNING")
+                    print(f"   Reason: {drift_result.get('reason', 'unknown')}")
+                    print("   💡 Consider stopping (Ctrl-C) and refocusing")
+                    print("=" * 60 + "\n")
+                    self.drift_detected = True
+
+            # Check for sycophancy
+            sycophancy_result = await self.marionette.sycophancy_detector.check(
+                output
+            )
+
+            if sycophancy_result.get('detected'):
+                print("\n" + "=" * 60)
+                print("⚠️  SYCOPHANCY DETECTED")
+                print(f"   Reason: {sycophancy_result.get('reason', 'unknown')}")
+                print("   💡 Claude may be over-agreeing without critical thinking")
+                print("=" * 60 + "\n")
+
+        except Exception as e:
+            print(f"⚠️  Analysis error: {e}")
+
+    async def _user_interaction_loop(self):
+        """Handle user input with validation before sending to Claude."""
+        print("💬 Type your prompts below (validated by Marionette before sending)")
+        print("   Commands: /stop = Ctrl-C, /escape = Esc Esc, /quit = exit\n")
+
+        while self.running:
+            try:
+                # Get user input in a non-blocking way
+                user_prompt = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: input("You: ").strip()
+                )
+
+                if not user_prompt:
                     continue
-                
-                await self.send_prompt(user_input)
-                
-            except KeyboardInterrupt:
+
+                # Handle special commands
+                if user_prompt == "/quit":
+                    print("👋 Exiting Marionette...")
+                    self.running = False
+                    break
+
+                elif user_prompt == "/stop":
+                    print("🛑 Sending Ctrl-C to Claude Code...")
+                    self._send_ctrl_c()
+                    continue
+
+                elif user_prompt == "/escape":
+                    print("⎋ Sending Esc Esc to Claude Code...")
+                    self._send_escape_sequence()
+                    continue
+
+                # Validate prompt quality
+                print("🔍 Validating prompt...")
+                quality_result = await self.marionette.prompt_quality.analyze(
+                    user_prompt
+                )
+
+                if not quality_result.get('approved', True):
+                    print("\n" + "=" * 60)
+                    print("❌ PROMPT QUALITY INSUFFICIENT")
+                    print(f"   Specificity: {quality_result.get('specificity', 0)}/10")
+                    print(f"   Completeness: {quality_result.get('completeness', 0)}/10")
+                    print(f"   Ambiguity: {quality_result.get('ambiguity', 10)}/10")
+
+                    if quality_result.get('suggestions'):
+                        print("\n   💡 Suggestions:")
+                        for suggestion in quality_result['suggestions']:
+                            print(f"      • {suggestion}")
+
+                    print("=" * 60 + "\n")
+                    print("Please rephrase your prompt with more detail.\n")
+                    continue
+
+                # Learn project context from early prompts
+                if len(user_prompt) > 50:
+                    await self.marionette.context_drift_monitor.learn_initial_goal([user_prompt])
+
+                # Send to Claude Code via tmux
+                print("✅ Prompt approved, sending to Claude Code...\n")
+                self._send_text(user_prompt)
+
+            except EOFError:
+                # Handle Ctrl-D
+                self.running = False
                 break
-        
-        # Cleanup
-        if self.claude_process:
-            self.claude_process.kill()
-        await self.marionette.shutdown()
+            except Exception as e:
+                print(f"❌ Error: {e}")
+
+    def _send_text(self, text: str):
+        """Send text to Claude Code via tmux send-keys."""
+        # Check if session exists
+        check = subprocess.run(
+            ["tmux", "list-sessions"],
+            capture_output=True,
+            text=True
+        )
+
+        if check.returncode != 0 or self.session_name not in check.stdout:
+            print(f"⚠️  tmux session '{self.session_name}' not found. Recreating...")
+            self._launch_claude_in_tmux()
+
+        # Escape special characters for tmux
+        escaped_text = text.replace('"', '\\"')
+
+        # Send the text (no Enter yet - Claude Code needs text input first)
+        result = subprocess.run([
+            "tmux", "send-keys", "-t", self.session_name,
+            "-l",  # Literal mode - don't interpret keys
+            text
+        ], capture_output=True, text=True)
+
+        if result.returncode != 0:
+            print(f"❌ Failed to send text to tmux: {result.stderr}")
+            return
+
+        # Now send Enter twice with a small delay to submit
+        # First Enter completes the input, second Enter submits the prompt
+        subprocess.run([
+            "tmux", "send-keys", "-t", self.session_name,
+            "C-m"
+        ], check=False)
+
+        time.sleep(0.2)  # Small delay to let Claude process the first Enter
+
+        subprocess.run([
+            "tmux", "send-keys", "-t", self.session_name,
+            "C-m"
+        ], check=False)
+
+    def _send_ctrl_c(self):
+        """Send Ctrl-C to Claude Code to interrupt current operation."""
+        subprocess.run([
+            "tmux", "send-keys", "-t", self.session_name,
+            "C-c"
+        ], check=False)
+
+    def _send_escape_sequence(self):
+        """Send Esc Esc to Claude Code to break loops."""
+        subprocess.run([
+            "tmux", "send-keys", "-t", self.session_name,
+            "Escape", "Escape"
+        ], check=False)
+
+    async def cleanup(self):
+        """Clean up tmux session and log file."""
+        self.running = False
+
+        # Kill tmux session
+        subprocess.run([
+            "tmux", "kill-session", "-t", self.session_name
+        ], capture_output=True)
+
+        print(f"🧹 Cleaned up session: {self.session_name}")
+
+        # Optionally keep log file
+        if self.log_file.exists():
+            print(f"📝 Log file saved: {self.log_file}")
 
 
 async def main():
-    """Run Claude Code with Marionette supervision."""
+    """Main entry point."""
+    # Initialize Marionette
     config = Config.from_env()
     marionette = Marionette(config)
-    
+    await marionette.start()
+
+    # Create wrapper and start
     wrapper = ClaudeCodeWrapper(marionette)
     await wrapper.start()
-    await wrapper.interactive_loop()
 
 
 if __name__ == "__main__":
